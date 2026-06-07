@@ -34,94 +34,149 @@ ThreadPool();
 ```C++
 1. // 存储线程和维护线程的容器及其线程工作函数workerthread
     std::vector<std::thread> threadpool;       
-    // 线程工作函数workerThread
+    // 线程工作函数
     void ThreadPool::workerThread()
     {
+        std::ostringstream This_threadID;
+        This_threadID << std::this_thread::get_id();
+        Logger::instance().debug("Worker thread started, ID: " + This_threadID.str());
         while (true)
         {
             std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mtx); // 每个线程独立锁
-                cv.wait(lock, [this]()
-                        { return stop || !taskqueue.empty(); }); // 条件变量(条件谓词为false,即线程池未销毁但缓冲区已为空时)阻塞
-                // 如果线程池销毁且任务为空,停止工作
-                if (stop && taskqueue.empty())
-                {
-                    return;
-                }
-                // 取出任务执行
-                task = std::move(taskqueue.front()); // 移动语义:队列任务只能转移,不可拷贝
-                taskqueue.pop();
+            if(!taskqueue->pop(task)){
+                Logger::instance().debug("Worker thread exiting or queue is empty,ID: " + This_threadID.str());
+                break;
             }
-            //原子变量无需使用互斥锁(可提高效率)
-            ++runningThreads;
-            // 处理异常,防止单个任务出问题导致整个线程崩溃
-            try
-            {
-                task(); // 执行任务
-                ++completeTasks;//完成的任务数
+            runningThreads.fetch_add(1);
+            try{
+                task();
+                completeTasks.fetch_add(1);
+            }catch(...){
+                failedTasks.fetch_add(1);
+                Logger::instance().warning("one task failed in thread,ID: " + This_threadID.str());
             }
-            catch (const std::exception &e)
-            {
-                ++failedTasks;//未完成的任务数
-            }
-            catch (...)
-            {
-                ++failedTasks;
-            }
-            --runningThreads;//正在工作的线程
+            runningThreads.fetch_sub(1);
         }
     }
+
 2. //任务队列(缓冲区)
-    std::queue<std::function<void()>> taskqueue;//创建function函数包装器(进行类型擦除,比模板队列更通用,但是会带来轻微性能开销)的队列
+    std::unique_ptr<TaskQueue> taskqueue = std::make_unique<TaskQueue>();//任务队列基类指针
 3. //线程同步:使用例如互斥锁,条件变量,原子变量确保线程安全
    //以下为具体例子:
     mutable std::mutex mtx;// mutble使其能在const函数中使用
     std::condition_variable cv;//条件变量(用于阻塞)
     std::atomic_bool stop;// 原子变量作为停止标志
-4. //任务调度enqueue函数
-    // 任务入列
+4. //任务提交函数
     template <typename F, typename... Args>
-    void entaskque(F &&f, Args &&...args)
+    auto submit(F &&f, Args &&...args)
     {
-        ++totalTasks;//总任务数
-        auto task = [func = std::forward<F>(f), argu = std::make_tuple(std::forward<Args>(args)...)]() mutable
-        { std::apply(func, argu); };// 使用元组进行参数绑定,使用apply执行
+        using return_type = std::invoke_result_t<F, Args...>;//推导返回值类型
         {
-            std::unique_lock<std::mutex> lock(mtx);//互斥锁保证线程安全
-            //如果线程池停止工作,中断入列
-            if (stop)
+            std::mutex mtx;
+            std::unique_lock<std::mutex> lock(mtx);
+            if (stop.load())
             {
                 throw std::runtime_error("ThreadPool is stopped!\n");
             }
-            taskqueue.emplace(std::move(task)); // 任务入列,lambda不可拷贝,使用移动语义
         }
-        cv.notify_one(); // 唤醒一个进程
+        // 如果没有返回值,直接加入队列
+        if constexpr (std::is_void_v<return_type>)
+        {
+            // 使用元组进行参数绑定,使用apply执行函数
+            auto task = [func = std::forward<F>(f), argu = std::make_tuple(std::forward<Args>(args)...)]() mutable
+            { std::apply(func, argu); };
+            if (!taskqueue->push(std::move(task))) // lambda不可拷贝,使用移动语义
+            {
+                Logger::instance().error("Task submission failed!");
+                throw std::runtime_error("Task submit failed!\n");
+            }
+            else
+            {
+                totalTasks.fetch_add(1);
+                Logger::instance().debug("Task submitted,total tasks: " + std::to_string(getTotalTasksCount()));
+            }
+        }
+        else
+        {
+            // 如果有返回值,返回future结果
+            auto task = std::make_shared<std::packaged_task<return_type()>>([func = std::forward<F>(f), argu = std::make_tuple(std::forward<Args>(args)...)]() mutable                     { return std::apply(func, argu); }); // 使用指针确保生命周期
+
+            std::future<return_type> resfuture = task->get_future();
+            if (!taskqueue->push([task]()
+                                    { (*task)(); }))
+            {
+                //如果提交失败,返回异常的future
+                Logger::instance().error("Task submission failed!");
+                std::promise<return_type> promise;
+                promise.set_exception(std::make_exception_ptr(std::runtime_error("Task submit failed!\n")));
+                return promise.get_future();
+            }
+            else
+            {
+                //如果提交成功,返回future对象
+                totalTasks.fetch_add(1);
+                Logger::instance().debug("Task submitted,total tasks: " + std::to_string(getTotalTasksCount()));
+                return resfuture;
+            }
+        }
     }
 5. //生命周期管理(构造函数及析构函数)
     // 构造函数
-    ThreadPool::ThreadPool(size_t count) : stop{false}, threadcount{count == 0 ? std::thread::hardware_concurrency() : count}, totalTasks{0}, completeTasks{0}, failedTasks{0}, runningThreads{0}
+    ThreadPool::ThreadPool(size_t count, QueMode mode) : stop{false}, threadcount{count == 0 ? std::thread::hardware_concurrency() : count}, totalTasks{0}, completeTasks{0}, failedTasks{0}, runningThreads{0}, quemode{mode}
     {
+        switch (quemode)
+        {
+        case QueMode::SPMC:
+            taskqueue = std::make_unique<SPMC_Queue>();
+            Logger::instance().debug("task_queue mode: SPMC");
+            break;
+        case QueMode::MPMC:
+            taskqueue = std::make_unique<MPMC_Queue>();
+            Logger::instance().debug("task_queue mode: MPMC");
+            break;
+        default:
+            Logger::instance().error("invalid argument for task_queue mode!");
+            break;
+        }
         // 添加线程,每个线程都添加相应的工作函数
         for (size_t i = 0; i < threadcount; ++i)
         {
             threadpool.emplace_back([this]()
                                     { this->workerThread(); });
         }
+        Logger::instance().info("ThreadPool initialized! Initial threads: " + std::to_string(threadcount));
     }
-    ThreadPool::ThreadPool() : stop{false}, threadcount{std::thread::hardware_concurrency()}, totalTasks{0}, completeTasks{0}, failedTasks{0}, runningThreads{0}
+    ThreadPool::ThreadPool(QueMode mode) : stop{false}, threadcount{std::thread::hardware_concurrency()}, totalTasks{0}, completeTasks{0}, failedTasks{0}, runningThreads{0}, quemode{mode}
     {
+        switch (quemode)
+        {
+        case QueMode::SPMC:
+            taskqueue = std::make_unique<SPMC_Queue>();
+            Logger::instance().debug("task_queue mode: SPMC");
+            break;
+        case QueMode::MPMC:
+            taskqueue = std::make_unique<MPMC_Queue>();
+            Logger::instance().debug("task_queue mode: MPMC");
+            break;
+        default:
+            Logger::instance().error("invalid argument for task_queue mode!");
+            break;
+        }
         for (size_t i = 0; i < threadcount; ++i)
         {
             threadpool.emplace_back([this]()
                                     { this->workerThread(); });
         }
+        Logger::instance().info("ThreadPool initialized! Initial threads: " + std::to_string(threadcount));
     }
+
     //析构函数
     ThreadPool::~ThreadPool()
     {
-        stop = true;
-        cv.notify_all(); // 唤醒所有阻塞的线程
+        Logger::instance().info("ThreadPool starting shutdown...");
+        stop.store(true);
+        taskqueue->Shutdown(); //关闭任务队列
+        cv.notify_all(); // 通知所有等待的线程
         // 等待所有线程完成任务
         for (auto &t : threadpool)
         {
@@ -157,7 +212,7 @@ ThreadPool();
 | 调试难度 |                 较易                  |                 困难                 |
 | 工作流程 | a操作,b阻塞并等待,a完成,b被唤醒并操作 | a,b通过CAS操作,成功就继续,失败就重试 |
 
-[^2]: ***具体需要的头文件及函数类型不同而分化的提交任务的函数实现***
+[^2]: ***具体需要的头文件及任务队列类的实现***
 
 ```C++
 //1-头文件
@@ -172,37 +227,123 @@ ThreadPool();
 #include <condition_variable>  //条件变量(condition_variable)
 #include <vector>  //线程存储容器(vector)
 #include <tuple>  //函数参数绑定(make_tuple,apply)
+#include "../logger/include/logger.h" //日志类
+#include "Task_Queue.h"               //封装的任务队列类
+#include <stdexcept> //异常类(runtime_error)
 
-//2-任务提交函数
-// 无返回值函数任务的提交
-template <typename F, typename... Args>
-void submit(F &&f, Args &&...args)
+//2-任务队列类的实现
+// 基类抽象
+enum class QueMode
 {
-    this->entaskque(f, args...);
-    Logger::instance().debug("Task submitted,total tasks: " + std::to_string(getTotalTasksCount()));
-}
-// 有返回值函数任务的提交(返回future异步获取结果)
-template <typename F, typename... Args>
-auto submit_result(F &&f, Args &&...args)  //返回std::future对象用于异步获取结果
+    SPMC = 1, // 一对多
+    MPMC = 2  // 多对多
+};
+
+class Task_Queue
 {
-    ++totalTasks;
-    using return_type = decltype(f(args...)); // 推导返回值类型
-    // 使用lambda函数,使用tuple绑定参数,apply执行包装函数
-    auto task = std::make_shared<std::packaged_task<return_type()>>(
-        [func = std::forward<F>(f), arg = std::make_tuple(std::forward<Args>(args)...)]() mutable
-        { return std::apply(func, arg); });               // 使用智能指针确保lambda执行时仍然有效
-    std::future<return_type> result = task->get_future(); // 异步获取结果
+    protected:
+    std::atomic_bool shutdown;
+public:
+    explicit Task_Queue():shutdown{false} {}
+    virtual ~Task_Queue()=default;                                 // 虚析构函数!!!
+    virtual bool push(std::function<void()> task) = 0;     // 添加任务
+    virtual bool pop(std::function<void()> &out_task) = 0; // 弹出任务(移动语义)
+    virtual size_t size() const = 0;                       // 返回队列任务数
+    virtual void Shutdown()=0;
+};
+
+// 一对多队列
+class SPMC_Queue : public Task_Queue
+{
+private:
+    std::queue<std::function<void()>> task_queue;
+    std::condition_variable not_empty;
+    mutable std::mutex mtx;
+
+public:
+    explicit SPMC_Queue() : Task_Queue() {}
+    ~SPMC_Queue(){
+        Shutdown();
+    }
+    bool push(std::function<void()> task) override
     {
         std::unique_lock<std::mutex> lock(mtx);
-        if (stop)
-        {
-            throw std::runtime_error("ThreadPool is stopped!\n");
-        }
-        taskqueue.emplace([task]()
-                            { (*task)(); });
+        if(shutdown.load()) // 关闭就退出
+            return false;
+        task_queue.emplace(std::move(task));
+        not_empty.notify_one(); //唤醒
+        return true;
     }
-    cv.notify_one(); // 入列后唤醒一个进程
-    Logger::instance().debug("Task submitted with result,total tasks: " + std::to_string(getTotalTasksCount()));
-    return result; // 返回future对象,后续异步获取结果
-}
+    bool pop(std::function<void()> &out_task) override
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        not_empty.wait(lock, [this]()
+                       { return !task_queue.empty()||shutdown.load(); });
+        if(task_queue.empty()&&shutdown.load()) 
+            return false;
+        out_task = std::move(task_queue.front());
+        task_queue.pop();
+        return true;
+    }
+    size_t size()const {
+        std::unique_lock<std::mutex> lock(mtx);
+        return task_queue.size();
+    }
+    void Shutdown()override {
+        shutdown.store(true);
+        not_empty.notify_all();
+    }
+};
+
+// 多对多队列
+class MPMC_Queue : public Task_Queue
+{
+    private:
+    std::condition_variable con_not_empty;            // 消费队列不空就不阻塞
+    mutable std::mutex con_mtx; // 消费锁
+    mutable std::mutex pro_mtx;
+    std::queue<std::function<void()>> pro_task_queue; // 生产者队列
+    std::queue<std::function<void()>> con_task_queue; // 消费者队列
+public:
+    MPMC_Queue():Task_Queue(){}
+    ~MPMC_Queue(){
+        Shutdown();
+    };
+    bool push(std::function<void()>task)override{
+        std::unique_lock<std::mutex> lock(pro_mtx);
+        if(shutdown.load())
+            return false;
+        pro_task_queue.emplace(std::move(task));
+        con_not_empty.notify_one();
+        return true;
+    }
+    bool pop(std::function<void()>&out_task)override {
+        std::unique_lock<std::mutex>lock(con_mtx);
+        con_not_empty.wait(lock, [this]()
+        { 
+            
+           if(!con_task_queue.empty()||shutdown.load())return true;
+           //消费队列为空,尝试去交换
+           std::lock_guard<std::mutex> l(pro_mtx);
+           if(!pro_task_queue.empty()){std::swap(pro_task_queue,con_task_queue);
+               return true;
+           }
+           return false; // 两个都为空时阻塞
+        
+        });
+        if(con_task_queue.empty())
+            return false;
+        out_task = std::move(con_task_queue.front());
+        con_task_queue.pop();
+        return true;
+    }
+    size_t size() const {
+        std::unique_lock<std::mutex> lock(con_mtx);
+        return con_task_queue.size()+pro_task_queue.size();
+    }
+    void Shutdown()override {
+        shutdown.store(true);
+        con_not_empty.notify_all();
+    }
+};
 ```
