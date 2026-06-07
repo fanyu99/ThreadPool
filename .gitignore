@@ -33,6 +33,7 @@ temp/
 build/
 bin/
 lib/
+output/
 Debug/
 Release/
 
