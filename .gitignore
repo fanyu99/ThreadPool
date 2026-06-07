@@ -1,0 +1,47 @@
+# ===== 系统垃圾 =====
+.DS_Store        # Mac系统文件
+Thumbs.db        # Windows系统文件
+desktop.ini
+
+# ===== 编辑器配置 =====
+.vscode/         # VS Code配置（除非你想同步给全团队）
+.idea/           # JetBrains系列（WebStorm/PyCharm）
+*.swp
+*.swo
+
+# ===== 日志与缓存 =====
+*.log
+*.cache
+.cache/
+tmp/
+temp/
+
+# ===== 环境文件（非常重要！）=====
+.env             # 本地环境变量（包含密码/密钥）
+.env.local
+.env.*.local
+# 编译产物
+*.o
+*.obj
+*.exe
+*.out
+*.so
+*.dll
+*.a
+
+# 构建目录
+build/
+bin/
+lib/
+Debug/
+Release/
+
+# IDE 配置
+.vscode/
+.idea/
+*.suo
+*.user
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
