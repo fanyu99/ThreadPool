@@ -8,7 +8,7 @@ desktop.ini
 .idea/           # JetBrains系列（WebStorm/PyCharm）
 *.swp
 *.swo
-
+.vs/
 # ===== 日志与缓存 =====
 *.log
 *.cache
